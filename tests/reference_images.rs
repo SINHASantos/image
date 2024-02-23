@@ -69,10 +69,9 @@ fn render_images() {
         out_path.push(testsuite.as_os_str());
         fs::create_dir_all(&out_path).unwrap();
         out_path.push(format!(
-            "{}.{}.{}",
+            "{}.{:x}.png",
             filename.as_os_str().to_str().unwrap(),
-            format!("{:x}", crc.finalize()),
-            "png"
+            crc.finalize(),
         ));
         img.save(out_path).unwrap();
     })
@@ -117,11 +116,11 @@ impl std::str::FromStr for ReferenceTestCase {
 
         if meta.len() == 1 {
             // `CRC`
-            crc = parse_crc(&meta[0]).ok_or("malformed CRC")?;
+            crc = parse_crc(meta[0]).ok_or("malformed CRC")?;
             kind = ReferenceTestKind::SingleImage;
         } else if meta.len() == 3 && meta[0] == "anim" {
             // `anim_FRAME_CRC`
-            crc = parse_crc(&meta[2]).ok_or("malformed CRC")?;
+            crc = parse_crc(meta[2]).ok_or("malformed CRC")?;
             let frame: usize = meta[1].parse().map_err(|_| "malformed frame number")?;
             kind = ReferenceTestKind::AnimatedFrame {
                 frame: frame.checked_sub(1).ok_or("frame number must be 1-based")?,
@@ -211,7 +210,7 @@ fn check_references() {
                     };
 
                     // Select a single frame
-                    let frame = frames.drain(frame_num..).nth(0).unwrap();
+                    let frame = frames.drain(frame_num..).next().unwrap();
 
                     // Convert the frame to a`RgbaImage`
                     test_img = Some(DynamicImage::from(frame.into_buffer()));
@@ -239,7 +238,7 @@ fn check_references() {
                     };
 
                     // Select a single frame
-                    let frame = frames.drain(frame_num..).nth(0).unwrap();
+                    let frame = frames.drain(frame_num..).next().unwrap();
 
                     // Convert the frame to a`RgbaImage`
                     test_img = Some(DynamicImage::from(frame.into_buffer()));
@@ -271,14 +270,35 @@ fn check_references() {
 
         let test_crc_actual = {
             let mut hasher = Crc32::new();
-            hasher.update(test_img.as_bytes());
+            match test_img {
+                DynamicImage::ImageLuma8(_)
+                | DynamicImage::ImageLumaA8(_)
+                | DynamicImage::ImageRgb8(_)
+                | DynamicImage::ImageRgba8(_) => hasher.update(test_img.as_bytes()),
+                DynamicImage::ImageLuma16(_)
+                | DynamicImage::ImageLumaA16(_)
+                | DynamicImage::ImageRgb16(_)
+                | DynamicImage::ImageRgba16(_) => {
+                    for v in test_img.as_bytes().chunks(2) {
+                        hasher.update(&u16::from_ne_bytes(v.try_into().unwrap()).to_le_bytes());
+                    }
+                }
+                DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => {
+                    for v in test_img.as_bytes().chunks(4) {
+                        hasher.update(&f32::from_ne_bytes(v.try_into().unwrap()).to_le_bytes());
+                    }
+                }
+                _ => panic!("Unsupported image format"),
+            }
             hasher.finalize()
         };
 
         if test_crc_actual != case.crc {
             panic!(
-                "The decoded image's hash does not match (expected = {:08x}, actual = {:08x}).",
-                case.crc, test_crc_actual
+                "{}: The decoded image's hash does not match (expected = {:08x}, actual = {:08x}).",
+                img_path.display(),
+                case.crc,
+                test_crc_actual
             );
         }
 

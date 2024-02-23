@@ -58,9 +58,10 @@ impl<W: Write> AvifEncoder<W> {
         AvifEncoder::new_with_speed_quality(w, 4, 80) // `cavif` uses these defaults
     }
 
-    /// Create a new encoder with specified speed and quality, that writes its output to `w`.
-    /// `speed` accepts a value in the range 0-10, where 0 is the slowest and 10 is the fastest.
-    /// `quality` accepts a value in the range 0-100, where 0 is the worst and 100 is the best.
+    /// Create a new encoder with a specified speed and quality that writes its output to `w`.
+    /// `speed` accepts a value in the range 1-10, where 1 is the slowest and 10 is the fastest.
+    /// Slower speeds generally yield better compression results.
+    /// `quality` accepts a value in the range 1-100, where 1 is the worst and 100 is the best.
     pub fn new_with_speed_quality(w: W, speed: u8, quality: u8) -> Self {
         // Clamp quality and speed to range
         let quality = min(quality, 100);
@@ -69,7 +70,8 @@ impl<W: Write> AvifEncoder<W> {
         let encoder = Encoder::new()
             .with_quality(f32::from(quality))
             .with_alpha_quality(f32::from(quality))
-            .with_speed(speed);
+            .with_speed(speed)
+            .with_depth(Some(8));
 
         AvifEncoder { inner: w, encoder }
     }
@@ -81,6 +83,13 @@ impl<W: Write> AvifEncoder<W> {
             .with_internal_color_space(color_space.to_ravif());
         self
     }
+
+    /// Configures `rayon` thread pool size.
+    /// The default `None` is to use all threads in the default `rayon` thread pool.
+    pub fn with_num_threads(mut self, num_threads: Option<usize>) -> Self {
+        self.encoder = self.encoder.with_num_threads(num_threads);
+        self
+    }
 }
 
 impl<W: Write> ImageEncoder for AvifEncoder<W> {
@@ -89,6 +98,7 @@ impl<W: Write> ImageEncoder for AvifEncoder<W> {
     /// The encoder currently requires all data to be RGBA8, it will be converted internally if
     /// necessary. When data is suitably aligned, i.e. u16 channels to two bytes, then the
     /// conversion may be more efficient.
+    #[track_caller]
     fn write_image(
         mut self,
         data: &[u8],
@@ -96,6 +106,15 @@ impl<W: Write> ImageEncoder for AvifEncoder<W> {
         height: u32,
         color: ColorType,
     ) -> ImageResult<()> {
+        let expected_buffer_len =
+            (width as u64 * height as u64).saturating_mul(color.bytes_per_pixel() as u64);
+        assert_eq!(
+            expected_buffer_len,
+            data.len() as u64,
+            "Invalid buffer length: expected {expected_buffer_len} got {} for {width}x{height} image",
+            data.len(),
+        );
+
         self.set_color(color);
         // `ravif` needs strongly typed data so let's convert. We can either use a temporarily
         // owned version in our own buffer or zero-copy if possible by using the input buffer.

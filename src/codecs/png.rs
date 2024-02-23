@@ -6,14 +6,12 @@
 //! * <http://www.w3.org/TR/PNG/> - The PNG Specification
 //!
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use num_rational::Ratio;
 use png::{BlendOp, DisposeOp};
 
-use crate::animation::{Delay, Frame, Frames};
+use crate::animation::{Delay, Frame, Frames, Ratio};
 use crate::color::{Blend, ColorType, ExtendedColorType};
 use crate::error::{
     DecodingError, EncodingError, ImageError, ImageResult, LimitError, LimitErrorKind,
@@ -79,7 +77,7 @@ impl<R: Read> Read for PngReader<R> {
                     let readed = buf.write(row.data()).unwrap();
                     bytes += readed;
 
-                    self.buffer = (&row.data()[readed..]).to_owned();
+                    self.buffer = row.data()[readed..].to_owned();
                     self.index = 0;
                 }
                 None => return Ok(bytes),
@@ -113,12 +111,13 @@ impl<R: Read> Read for PngReader<R> {
 pub struct PngDecoder<R: Read> {
     color_type: ColorType,
     reader: png::Reader<R>,
+    limits: Limits,
 }
 
 impl<R: Read> PngDecoder<R> {
     /// Creates a new decoder that decodes from the stream ```r```
     pub fn new(r: R) -> ImageResult<PngDecoder<R>> {
-        Self::with_limits(r, Limits::default())
+        Self::with_limits(r, Limits::no_limits())
     }
 
     /// Creates a new decoder that decodes from the stream ```r``` with the given limits.
@@ -127,6 +126,7 @@ impl<R: Read> PngDecoder<R> {
 
         let max_bytes = usize::try_from(limits.max_alloc.unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
         let mut decoder = png::Decoder::new_with_limits(r, png::Limits { bytes: max_bytes });
+        decoder.set_ignore_text_chunk(true);
 
         let info = decoder.read_header_info().map_err(ImageError::from_png)?;
         limits.check_dimensions(info.width, info.height)?;
@@ -191,7 +191,27 @@ impl<R: Read> PngDecoder<R> {
             }
         };
 
-        Ok(PngDecoder { color_type, reader })
+        Ok(PngDecoder {
+            color_type,
+            reader,
+            limits,
+        })
+    }
+
+    /// Returns the gamma value of the image or None if no gamma value is indicated.
+    ///
+    /// If an sRGB chunk is present this method returns a gamma value of 0.45455 and ignores the
+    /// value in the gAMA chunk. This is the recommended behavior according to the PNG standard:
+    ///
+    /// > When the sRGB chunk is present, [...] decoders that recognize the sRGB chunk but are not
+    /// > capable of colour management are recommended to ignore the gAMA and cHRM chunks, and use
+    /// > the values given above as if they had appeared in gAMA and cHRM chunks.
+    pub fn gamma_value(&self) -> ImageResult<Option<f64>> {
+        Ok(self
+            .reader
+            .info()
+            .source_gamma
+            .map(|x| x.into_scaled() as f64 / 100000.0))
     }
 
     /// Turn this into an iterator over the animation frames.
@@ -258,7 +278,7 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for PngDecoder<R> {
 
         match bpc {
             1 => (), // No reodering necessary for u8
-            2 => buf.chunks_mut(2).for_each(|c| {
+            2 => buf.chunks_exact_mut(2).for_each(|c| {
                 let v = BigEndian::read_u16(c);
                 NativeEndian::write_u16(c, v)
             }),
@@ -270,6 +290,16 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for PngDecoder<R> {
     fn scanline_bytes(&self) -> u64 {
         let width = self.reader.info().width;
         self.reader.output_line_size(width) as u64
+    }
+
+    fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
+        limits.check_support(&crate::io::LimitSupport::default())?;
+        let info = self.reader.info();
+        limits.check_dimensions(info.width, info.height)?;
+        self.limits = limits;
+        // TODO: add `png::Reader::change_limits()` and call it here
+        // to also constrain the internal buffer allocations in the PNG crate
+        Ok(())
     }
 }
 
@@ -283,9 +313,9 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for PngDecoder<R> {
 pub struct ApngDecoder<R: Read> {
     inner: PngDecoder<R>,
     /// The current output buffer.
-    current: RgbaImage,
+    current: Option<RgbaImage>,
     /// The previous output buffer, used for dispose op previous.
-    previous: RgbaImage,
+    previous: Option<RgbaImage>,
     /// The dispose op of the current frame.
     dispose: DisposeOp,
     /// The number of image still expected to be able to load.
@@ -296,7 +326,6 @@ pub struct ApngDecoder<R: Read> {
 
 impl<R: Read> ApngDecoder<R> {
     fn new(inner: PngDecoder<R>) -> Self {
-        let (width, height) = inner.dimensions();
         let info = inner.reader.info();
         let remaining = match info.animation_control() {
             // The expected number of fcTL in the remaining image.
@@ -308,9 +337,8 @@ impl<R: Read> ApngDecoder<R> {
         let has_thumbnail = info.frame_control.is_none();
         ApngDecoder {
             inner,
-            // TODO: should we delay this allocation? At least if we support limits we should.
-            current: RgbaImage::new(width, height),
-            previous: RgbaImage::new(width, height),
+            current: None,
+            previous: None,
             dispose: DisposeOp::Background,
             remaining,
             has_thumbnail,
@@ -321,6 +349,24 @@ impl<R: Read> ApngDecoder<R> {
 
     /// Decode one subframe and overlay it on the canvas.
     fn mix_next_frame(&mut self) -> Result<Option<&RgbaImage>, ImageError> {
+        // The iterator always produces RGBA8 images
+        const COLOR_TYPE: ColorType = ColorType::Rgba8;
+
+        // Allocate the buffers, honoring the memory limits
+        let (width, height) = self.inner.dimensions();
+        {
+            let limits = &mut self.inner.limits;
+            if self.previous.is_none() {
+                limits.reserve_buffer(width, height, COLOR_TYPE)?;
+                self.previous = Some(RgbaImage::new(width, height));
+            }
+
+            if self.current.is_none() {
+                limits.reserve_buffer(width, height, COLOR_TYPE)?;
+                self.current = Some(RgbaImage::new(width, height));
+            }
+        }
+
         // Remove this image from remaining.
         self.remaining = match self.remaining.checked_sub(1) {
             None => return Ok(None),
@@ -333,34 +379,52 @@ impl<R: Read> ApngDecoder<R> {
 
         // Skip the thumbnail that is not part of the animation.
         if self.has_thumbnail {
-            self.has_thumbnail = false;
+            // Clone the limits so that our one-off allocation that's destroyed after this scope doesn't persist
+            let mut limits = self.inner.limits.clone();
+            limits.reserve_usize(self.inner.reader.output_buffer_size())?;
             let mut buffer = vec![0; self.inner.reader.output_buffer_size()];
+            // TODO: add `png::Reader::change_limits()` and call it here
+            // to also constrain the internal buffer allocations in the PNG crate
             self.inner
                 .reader
                 .next_frame(&mut buffer)
                 .map_err(ImageError::from_png)?;
+            self.has_thumbnail = false;
         }
 
         self.animatable_color_type()?;
 
+        // We've initialized them earlier in this function
+        let previous = self.previous.as_mut().unwrap();
+        let current = self.current.as_mut().unwrap();
+
         // Dispose of the previous frame.
         match self.dispose {
             DisposeOp::None => {
-                self.previous.clone_from(&self.current);
+                previous.clone_from(current);
             }
             DisposeOp::Background => {
-                self.previous.clone_from(&self.current);
-                self.current
+                previous.clone_from(current);
+                current
                     .pixels_mut()
                     .for_each(|pixel| *pixel = Rgba([0, 0, 0, 0]));
             }
             DisposeOp::Previous => {
-                self.current.clone_from(&self.previous);
+                current.clone_from(previous);
             }
         }
 
+        // The allocations from now on are not going to persist,
+        // and will be destroyed at the end of the scope.
+        // Clone the limits so that any changes to them die with the allocations.
+        let mut limits = self.inner.limits.clone();
+
         // Read next frame data.
-        let mut buffer = vec![0; self.inner.reader.output_buffer_size()];
+        let raw_frame_size = self.inner.reader.output_buffer_size();
+        limits.reserve_usize(raw_frame_size)?;
+        let mut buffer = vec![0; raw_frame_size];
+        // TODO: add `png::Reader::change_limits()` and call it here
+        // to also constrain the internal buffer allocations in the PNG crate
         self.inner
             .reader
             .next_frame(&mut buffer)
@@ -388,6 +452,7 @@ impl<R: Read> ApngDecoder<R> {
         };
 
         // Turn the data into an rgba image proper.
+        limits.reserve_buffer(width, height, COLOR_TYPE)?;
         let source = match self.inner.color_type {
             ColorType::L8 => {
                 let image = ImageBuffer::<Luma<_>, _>::from_raw(width, height, buffer).unwrap();
@@ -408,17 +473,19 @@ impl<R: Read> ApngDecoder<R> {
             }
             _ => unreachable!("Invalid png color"),
         };
+        // We've converted the raw frame to RGBA8 and disposed of the original allocation
+        limits.free_usize(raw_frame_size);
 
         match blend {
             BlendOp::Source => {
-                self.current
+                current
                     .copy_from(&source, px, py)
                     .expect("Invalid png image not detected in png");
             }
             BlendOp::Over => {
                 // TODO: investigate speed, speed-ups, and bounds-checks.
                 for (x, y, p) in source.enumerate_pixels() {
-                    self.current.get_pixel_mut(x + px, y + py).blend(p);
+                    current.get_pixel_mut(x + px, y + py).blend(p);
                 }
             }
         }
@@ -426,7 +493,7 @@ impl<R: Read> ApngDecoder<R> {
         // Ok, we can proceed with actually remaining images.
         self.remaining = remaining;
         // Return composited output buffer.
-        Ok(Some(&self.current))
+        Ok(Some(self.current.as_ref().unwrap()))
     }
 
     fn animatable_color_type(&self) -> Result<(), ImageError> {
@@ -483,10 +550,12 @@ pub struct PngEncoder<W: Write> {
 /// Compression level of a PNG encoder. The default setting is `Fast`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum CompressionType {
     /// Default compression level
     Default,
     /// Fast, minimal compression
+    #[default]
     Fast,
     /// High compression level
     Best,
@@ -503,6 +572,7 @@ pub enum CompressionType {
 /// The default filter is `Adaptive`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum FilterType {
     /// No processing done, best used for low bit depth grayscale or data with a
     /// low color count
@@ -517,6 +587,7 @@ pub enum FilterType {
     Paeth,
     /// Uses a heuristic to select one of the preceding filters for each
     /// scanline rather than one filter for the entire image
+    #[default]
     Adaptive,
 }
 
@@ -543,7 +614,7 @@ impl<W: Write> PngEncoder<W> {
     /// option for encoding a particular image. That is, using options that map directly to a PNG
     /// image parameter will use this parameter where possible. But variants that have no direct
     /// mapping may be interpreted differently in minor versions. The exact output is expressly
-    /// __not__ part the SemVer stability guarantee.
+    /// __not__ part of the SemVer stability guarantee.
     ///
     /// Note that it is not optimal to use a single filter type, so an adaptive
     /// filter type is selected as the default. The filter which best minimizes
@@ -631,6 +702,7 @@ impl<W: Write> ImageEncoder for PngEncoder<W> {
     /// For color types with 16-bit per channel or larger, the contents of `buf` should be in
     /// native endian. PngEncoder will automatically convert to big endian as required by the
     /// underlying PNG format.
+    #[track_caller]
     fn write_image(
         self,
         buf: &[u8],
@@ -640,6 +712,15 @@ impl<W: Write> ImageEncoder for PngEncoder<W> {
     ) -> ImageResult<()> {
         use byteorder::{BigEndian, ByteOrder, NativeEndian};
         use ColorType::*;
+
+        let expected_bufffer_len =
+            (width as u64 * height as u64).saturating_mul(color_type.bytes_per_pixel() as u64);
+        assert_eq!(
+            expected_bufffer_len,
+            buf.len() as u64,
+            "Invalid buffer length: expected {expected_bufffer_len} got {} for {width}x{height} image",
+            buf.len(),
+        );
 
         // PNG images are big endian. For 16 bit per channel and larger types,
         // the buffer may need to be reordered to big endian per the
@@ -655,8 +736,8 @@ impl<W: Write> ImageEncoder for PngEncoder<W> {
                 // yet take Write/Read traits, create a temporary buffer for
                 // big endian reordering.
                 let mut reordered = vec![0; buf.len()];
-                buf.chunks(2)
-                    .zip(reordered.chunks_mut(2))
+                buf.chunks_exact(2)
+                    .zip(reordered.chunks_exact_mut(2))
                     .for_each(|(b, r)| BigEndian::write_u16(r, NativeEndian::read_u16(b)));
                 self.encode_inner(&reordered, width, height, color_type)
             }
@@ -691,18 +772,6 @@ impl ImageError {
     }
 }
 
-impl Default for CompressionType {
-    fn default() -> Self {
-        CompressionType::Fast
-    }
-}
-
-impl Default for FilterType {
-    fn default() -> Self {
-        FilterType::Adaptive
-    }
-}
-
 impl fmt::Display for BadPngRepresentation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -720,10 +789,9 @@ impl std::error::Error for BadPngRepresentation {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::ImageDecoder;
     use crate::ImageOutputFormat;
 
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
     #[test]
     fn ensure_no_decoder_off_by_one() {
@@ -741,6 +809,7 @@ mod tests {
             "Image MUST have the Rgb8 format"
         ];
 
+        #[allow(deprecated)]
         let correct_bytes = dec
             .into_reader()
             .expect("Unable to read file")

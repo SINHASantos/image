@@ -8,7 +8,6 @@ use crate::{
 };
 use byteorder::ReadBytesExt;
 use std::{
-    convert::TryFrom,
     io::{self, Read, Seek},
     mem,
 };
@@ -435,7 +434,11 @@ impl<'a, R: 'a + Read + Seek> ImageDecoder<'a> for TgaDecoder<R> {
 
     fn into_reader(self) -> ImageResult<Self::Reader> {
         Ok(TGAReader {
-            buffer: ImageReadBuffer::new(self.scanline_bytes(), self.total_bytes()),
+            buffer: ImageReadBuffer::new(
+                #[allow(deprecated)]
+                self.scanline_bytes(),
+                self.total_bytes(),
+            ),
             decoder: self,
         })
     }

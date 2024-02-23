@@ -13,7 +13,6 @@
 //!
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::convert::TryInto;
 use std::default::Default;
 use std::io::Read;
 use std::{cmp, error, fmt};
@@ -50,9 +49,10 @@ const B_HU_PRED: i8 = 9;
 
 // Prediction mode enum
 #[repr(i8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum LumaMode {
     /// Predict DC using row above and column to the left.
+    #[default]
     DC = DC_PRED,
 
     /// Predict rows using row above.
@@ -69,9 +69,10 @@ enum LumaMode {
 }
 
 #[repr(i8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum ChromaMode {
     /// Predict DC using row above and column to the left.
+    #[default]
     DC = DC_PRED,
 
     /// Predict rows using row above.
@@ -85,8 +86,9 @@ enum ChromaMode {
 }
 
 #[repr(i8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum IntraMode {
+    #[default]
     DC = B_DC_PRED,
     TM = B_TM_PRED,
     VE = B_VE_PRED,
@@ -1262,7 +1264,7 @@ impl<R: Read> Vp8Decoder<R> {
 
             self.top = init_top_macroblocks(self.frame.width as usize);
             // Almost always the first macro block, except when non exists (i.e. `width == 0`)
-            self.left = self.top.get(0).cloned().unwrap_or_else(MacroBlock::default);
+            self.left = self.top.first().cloned().unwrap_or_default();
 
             self.mbwidth = (self.frame.width + 15) / 16;
             self.mbheight = (self.frame.height + 15) / 16;
@@ -2036,6 +2038,7 @@ impl<R: Read> Vp8Decoder<R> {
         //high edge variance threshold
         let mut hev_threshold = 0;
 
+        #[allow(clippy::collapsible_else_if)]
         if self.frame.keyframe {
             if filter_level >= 40 {
                 hev_threshold = 2;
@@ -2125,12 +2128,6 @@ impl LumaMode {
     }
 }
 
-impl Default for LumaMode {
-    fn default() -> Self {
-        LumaMode::DC
-    }
-}
-
 impl ChromaMode {
     fn from_i8(val: i8) -> Option<Self> {
         Some(match val {
@@ -2140,12 +2137,6 @@ impl ChromaMode {
             TM_PRED => ChromaMode::TM,
             _ => return None,
         })
-    }
-}
-
-impl Default for ChromaMode {
-    fn default() -> Self {
-        ChromaMode::DC
     }
 }
 
@@ -2164,12 +2155,6 @@ impl IntraMode {
             B_HU_PRED => IntraMode::HU,
             _ => return None,
         })
-    }
-}
-
-impl Default for IntraMode {
-    fn default() -> Self {
-        IntraMode::DC
     }
 }
 
@@ -2598,7 +2583,7 @@ mod test {
 
     #[cfg(feature = "benchmarks")]
     fn make_sample_image() -> Vec<u8> {
-        let mut v = Vec::with_capacity((W * H * 4) as usize);
+        let mut v = Vec::with_capacity(W * H * 4);
         for c in 0u8..=255 {
             for k in 0u8..=255 {
                 v.push(c);
@@ -2636,7 +2621,7 @@ mod test {
         ];
 
         b.iter(|| {
-            black_box(predict_4x4(&mut v, W * 2, &modes, &res_data));
+            predict_4x4(&mut v, W * 2, &modes, &res_data);
         });
     }
 
@@ -2656,7 +2641,7 @@ mod test {
         let mut v = black_box(make_sample_image());
 
         b.iter(|| {
-            black_box(predict_bldpred(black_box(&mut v), 5, 5, W * 2));
+            predict_bldpred(black_box(&mut v), 5, 5, W * 2);
         });
     }
 
@@ -2666,7 +2651,7 @@ mod test {
         let mut v = black_box(make_sample_image());
 
         b.iter(|| {
-            black_box(predict_brdpred(black_box(&mut v), 5, 5, W * 2));
+            predict_brdpred(black_box(&mut v), 5, 5, W * 2);
         });
     }
 
@@ -2676,7 +2661,7 @@ mod test {
         let mut v = black_box(make_sample_image());
 
         b.iter(|| {
-            black_box(predict_bhepred(black_box(&mut v), 5, 5, W * 2));
+            predict_bhepred(black_box(&mut v), 5, 5, W * 2);
         });
     }
 

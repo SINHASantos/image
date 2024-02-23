@@ -1,7 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::borrow::Cow;
-use std::convert::TryFrom;
 use std::io::{self, Write};
 
 use crate::error::{
@@ -436,6 +435,11 @@ impl<W: Write> JpegEncoder<W> {
     /// and ```ColorType``` ```c```
     ///
     /// The Image in encoded with subsampling ratio 4:2:2
+    ///
+    /// # Panics
+    ///
+    /// Panics if `width * height * color_type.bytes_per_pixel() != image.len()`.
+    #[track_caller]
     pub fn encode(
         &mut self,
         image: &[u8],
@@ -443,6 +447,15 @@ impl<W: Write> JpegEncoder<W> {
         height: u32,
         color_type: ColorType,
     ) -> ImageResult<()> {
+        let expected_buffer_len =
+            (width as u64 * height as u64).saturating_mul(color_type.bytes_per_pixel() as u64);
+        assert_eq!(
+            expected_buffer_len,
+            image.len() as u64,
+            "Invalid buffer length: expected {expected_buffer_len} got {} for {width}x{height} image",
+            image.len(),
+        );
+
         match color_type {
             ColorType::L8 => {
                 let image: ImageBuffer<Luma<_>, _> =
@@ -654,6 +667,7 @@ impl<W: Write> JpegEncoder<W> {
 }
 
 impl<W: Write> ImageEncoder for JpegEncoder<W> {
+    #[track_caller]
     fn write_image(
         mut self,
         buf: &[u8],
@@ -752,7 +766,7 @@ fn build_quantization_segment(m: &mut Vec<u8>, precision: u8, identifier: u8, qt
 }
 
 fn encode_coefficient(coefficient: i32) -> (u8, u16) {
-    let mut magnitude = coefficient.abs() as u16;
+    let mut magnitude = coefficient.unsigned_abs() as u16;
     let mut num_bits = 0u8;
 
     while magnitude > 0 {
@@ -955,8 +969,7 @@ mod tests {
                 assert_eq!(err.kind(), DimensionMismatch)
             }
             other => {
-                assert!(
-                    false,
+                panic!(
                     "Encoding an image that is too large should return a DimensionError \
                                 it returned {:?} instead",
                     other
@@ -1058,7 +1071,7 @@ mod tests {
         let qtable = [0u8; 64];
         build_quantization_segment(&mut buf, 8, 1, &qtable);
         let mut expected = vec![];
-        expected.push(0 << 4 | 1);
+        expected.push(1);
         expected.extend_from_slice(&[0; 64]);
         assert_eq!(buf, expected)
     }
@@ -1068,7 +1081,7 @@ mod tests {
     fn bench_jpeg_encoder_new(b: &mut Bencher) {
         b.iter(|| {
             let mut y = vec![];
-            let x = JpegEncoder::new(&mut y);
+            let _x = JpegEncoder::new(&mut y);
         })
     }
 }

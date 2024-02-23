@@ -2,24 +2,22 @@ name: Rust CI
 
 on:
   push:
-    branches: [ master, next ]
+    branches: [ master, main, next ]
   pull_request:
-    branches: [ master, next ]
+    branches: [ master, main, next ]
+  schedule:
+    - cron: '5 16 * * 6'
 
 jobs:
-  build:
-    name: Run tests and doctests on ubuntu
+  test_features:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        rust: ["1.61.0", stable, beta, nightly]
-        features: [gif, jpeg, png, tiff, ico, pnm, tga, webp, bmp, hdr, dxt, dds, farbfeld, openexr, jpeg_rayon, webp-encoder, '']
+        features: ['', default, gif, jpeg, png, tiff, ico, pnm, tga, webp, bmp, hdr, dxt, dds, farbfeld, openexr, jpeg_rayon, webp-encoder]
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ matrix.rust }}
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: Cache Cargo Dependencies
       uses: Swatinem/rust-cache@v2
       with:
@@ -29,111 +27,103 @@ jobs:
       env:
         FEATURES: ${{ matrix.features }}
     - name: test
-      if: ${{ matrix.rust == 'stable' || matrix.rust == 'beta' || matrix.rust == 'nightly' }}
       run: >
         cargo test -v --no-default-features --features "$FEATURES" &&
         cargo doc -v --no-default-features --features "$FEATURES"
       env:
         FEATURES: ${{ matrix.features }}
 
-  build_big_endian:
-    name: Run tests on big endian architecture
-
-    # github actions does not support big endian systems directly, but it does support QEMU.
-    # so we install qemu, then build and run the tests in an emulated mips system.
-    # note: you can also use this approach to test for big endian locally.
-    runs-on: ubuntu-20.04
+  test_toolchains:
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        features: [gif, jpeg, png, tiff, ico, pnm, tga, webp, bmp, hdr, dxt, dds, farbfeld, openexr, jpeg_rayon, webp-encoder, '']
-
-    # we are using the cross project for cross compilation to mips:
-    # https://github.com/cross-rs/cross
+        rust: ["1.63.0", nightly, beta]
     steps:
-      - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
+    - uses: dtolnay/rust-toolchain@nightly
+      if: ${{ matrix.rust == '1.63.0' }}
+    - name: Generate Cargo.lock with minimal-version dependencies
+      if: ${{ matrix.rust == '1.63.0' }}
+      run: cargo -Zminimal-versions generate-lockfile
+
+    - uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust }}
+    - name: Cache Cargo Dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+    - name: build
+      run: cargo build -v --features webp,webp-encoder
+    - name: test
+      if: ${{ matrix.rust != '1.63.0' }}
+      run: >
+        cargo test -v --features webp,webp-encoder &&
+        cargo doc -v --features webp,webp-encoder
+
+  test_other_archs:
+    # github actions does not support 32-bit or big endian systems directly, but
+    # it does support QEMU. so we install qemu, then build and run the tests in
+    # an emulated mips system. NOTE: you can also use this approach to test for
+    # big endian locally.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [powerpc-unknown-linux-gnu, i686-unknown-linux-gnu]
+        features: [default, webp-encoder]
+    steps:
+      - uses: actions/checkout@v4
       - name: Install or use cached cross-rs/cross
-        uses: baptiste0928/cargo-install@v1
+        uses: baptiste0928/cargo-install@v2
         with:
           crate: cross
-
       - name: Cache Cargo Dependencies
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-
       - name: Start Docker (required for cross-rs)
         run: sudo systemctl start docker
-
-      - name: Cross-Compile project to mips-unknown-linux-gnu
+      - name: Cross-Run Tests using QEMU
         run: |
-          cross build --target=mips-unknown-linux-gnu --verbose -v --no-default-features --features "$FEATURES"
+          cross test --target ${{ matrix.arch }} --verbose -v --no-default-features --features "$FEATURES"
         env:
           FEATURES: ${{ matrix.features }}
-
-      # https://github.com/cross-rs/cross#supported-targets
-      - name: Cross-Run Tests in mips-unknown-linux-gnu using Qemu
-        continue-on-error: true
-        run: |
-          cross test --target mips-unknown-linux-gnu --verbose -v --no-default-features --features "$FEATURES"
-        env:
-          FEATURES: ${{ matrix.features }}
-
-  test_defaults:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
-    - name: build
-      run: cargo build -v --release
-    - name: test
-      run: cargo test -v --release
 
   test_avif:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: install-dependencies
       run: sudo apt update && sudo apt install nasm
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: build
       run: cargo build -v --no-default-features --features="avif"
 
   test_avif_decoding:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: install-dependencies
       run: sudo apt update && sudo apt install ninja-build meson nasm
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: build
-      run: cargo build -v --no-default-features --features="avif-decoder"
+      run: cargo build -v --no-default-features --features="avif,avif-decoder"
       env:
         SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: always
 
   clippy:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: install-dependencies
       run: sudo apt update && sudo apt install ninja-build meson nasm
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
       with:
-        toolchain: stable
-        override: true
         components: clippy
-    - uses: actions-rs/cargo@v1
-      with:
-        args: clippy --all-features -- -D warnings
+    - run: cargo clippy --all-features --all-targets -- -D warnings
       env:
         SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: always
 
@@ -141,16 +131,13 @@ jobs:
     name: "Fuzz targets (afl)"
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
     - name: install-deps
       run: sudo apt-get -y install clang llvm
     - name: build
       run: |
-        cargo install afl
+        cargo install cargo-afl
         cd fuzz-afl
         cargo check --bin reproduce_webp
         cargo check --bin reproduce_pnm
@@ -163,11 +150,8 @@ jobs:
     name: "Fuzz targets (cargo-fuzz)"
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
     - name: build
       run: |
         cargo install cargo-fuzz
@@ -179,14 +163,10 @@ jobs:
         done
 
   public_private_dependencies:
-    name: "Public private dependencies"
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
     - name: build
       run: |
         mv ./Cargo.toml.public-private-dependencies ./Cargo.toml
@@ -197,45 +177,39 @@ jobs:
   build_benchmarks:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
     - name: build
       run: cargo build -v --benches --features=benchmarks
 
   rustfmt:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: stable
-        override: true
         components: rustfmt
     - name: Run rustfmt check
-      uses: actions-rs/cargo@v1
-      with:
-        command: fmt
-        args: -- --check
+      run: cargo fmt -- --check
 
   cargo-deny:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v1
 
   verify_msrv:
-    name: Verify Minimum Supported Rust Version in Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-
+      - uses: actions/checkout@v4
       - name: Install or use cached `cargo-msrv`
-        uses: baptiste0928/cargo-install@v1
+        uses: baptiste0928/cargo-install@v2
         with:
           crate: cargo-msrv
 
-      - name: Verify Minimum Rust Version
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Generate Cargo.lock with minimal-version dependencies
+        run: cargo -Zminimal-versions generate-lockfile
+
+      - name: Verify Minimum Rust Version against `-Zminimal-versions` dependencies
         run: cargo-msrv verify

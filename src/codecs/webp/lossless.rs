@@ -4,8 +4,6 @@
 //!
 
 use std::{
-    convert::TryFrom,
-    convert::TryInto,
     error, fmt,
     io::Read,
     ops::{AddAssign, Shl},
@@ -311,7 +309,7 @@ impl<R: Read> LosslessDecoder<R> {
     }
 
     /// Adjusts the color map since it's subtraction coded
-    fn adjust_color_map(color_map: &mut Vec<u32>) {
+    fn adjust_color_map(color_map: &mut [u32]) {
         for i in 1..color_map.len() {
             color_map[i] = add_pixels(color_map[i], color_map[i - 1]);
         }

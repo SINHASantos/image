@@ -1,8 +1,6 @@
 //! Input and output of images.
 
-use std::convert::TryFrom;
-
-use crate::{error, ImageError, ImageResult};
+use crate::{error, ColorType, ImageError, ImageResult};
 
 pub(crate) mod free_functions;
 mod reader;
@@ -12,10 +10,12 @@ pub use self::reader::Reader;
 /// Set of supported strict limits for a decoder.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[allow(missing_copy_implementations)]
+#[allow(clippy::manual_non_exhaustive)]
 pub struct LimitSupport {
     _non_exhaustive: (),
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for LimitSupport {
     fn default() -> LimitSupport {
         LimitSupport {
@@ -47,6 +47,7 @@ impl Default for LimitSupport {
 /// [`ImageDecoder::set_limits`]: ../trait.ImageDecoder.html#method.set_limits
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[allow(missing_copy_implementations)]
+#[allow(clippy::manual_non_exhaustive)]
 pub struct Limits {
     /// The maximum allowed image width. This limit is strict. The default is no limit.
     pub max_image_width: Option<u32>,
@@ -128,16 +129,30 @@ impl Limits {
     pub fn reserve_usize(&mut self, amount: usize) -> ImageResult<()> {
         match u64::try_from(amount) {
             Ok(n) => self.reserve(n),
-            Err(_) if self.max_alloc.is_some() => {
-                return Err(ImageError::Limits(error::LimitError::from_kind(
-                    error::LimitErrorKind::InsufficientMemory,
-                )));
-            }
+            Err(_) if self.max_alloc.is_some() => Err(ImageError::Limits(
+                error::LimitError::from_kind(error::LimitErrorKind::InsufficientMemory),
+            )),
             Err(_) => {
                 // Out of bounds, but we weren't asked to consider any limit.
                 Ok(())
             }
         }
+    }
+
+    /// This function acts identically to [`reserve`], but accepts the width, height and color type
+    /// used to create an [`ImageBuffer`] and does all the math for you.
+    pub fn reserve_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        color_type: ColorType,
+    ) -> ImageResult<()> {
+        self.check_dimensions(width, height)?;
+        let in_memory_size = (width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(color_type.bytes_per_pixel().into());
+        self.reserve(in_memory_size)?;
+        Ok(())
     }
 
     /// This function increases the `max_alloc` limit with amount. Should only be used

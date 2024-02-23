@@ -1,23 +1,62 @@
-# Rust Image Release Notes
-
-Rust image aims to be a pure-Rust implementation of various popular image formats. Accompanying reading/write support, rust image provides basic imaging processing function. See `README.md` for further details.
+# Release Notes
 
 ## Known issues
- - Not all Interlaced (progressive) or animated images are well supported.
- - The color space information of pixels is not clearly communicated.
- - Initialization via byte-based buffers and ffi is a work-in-progress.
+- Many decoders will panic on malicous input. In most cases, this is caused by
+  not enforcing memory limits, though other panics have been seen from fuzzing.
+- The color space information of pixels is not clearly communicated.
 
 ## Changes
 
-### Unreleased
+### Version 0.24.9
 
-- More convenient to use buffers will be added in the future. In particular,
-  improving initialization, passing of output buffers, and adding a more
-  complete representation for layouts. The plan is for these to interact with
-  the rest of the library through a byte-based interface similar to
-  `ImageDecoder`.
-  See ongoing work on [`image-canvas`](https://github.com/image-rs/canvas) if
-  you want to participate.
+Structural changes:
+- Relicense to MIT OR Apache-2.0
+- Increase MSRV 1.63.0
+
+New features:
+- Support limits in PNG animation decoding.
+- Added offsets to SubImage to compensate for the now-deprecated bounds call
+  from GenericImageView.
+
+Bug fixes:
+- Correct limit tests for TIFF.
+- Avoid overflow in gif::Decoder::buffer_size.
+- Return error instead of using asssertion for Avif decoder unsupported or
+  invalid bit depth.
+
+### Version 0.24.8
+
+New features:
+- Added pure-Rust lossless WebP encoding.
+- Added `DynamicImage::new` method.
+- Added `PngDecoder::gamma_value` method.
+- Added `ImageFormat::{reading_enabled, writing_enabled, all}`.
+- TGA encoder now supports RLE encoding.
+- Add rayon parallel iterators behind an optional `rayon` feature.
+- Support CMYK TIFF images.
+- Implement `From<DynamicImage>` for all image types.
+
+Bug fixes:
+- Fix decoding pngs with invalid text chunks.
+- Handle non-fatal error dav1d::Error::Again.
+- Do not round floats in interpolate.
+- PNM decoder now scales samples according to specified maximum.
+- Fix wrong implementation of unsharpen filter.
+- Fix `GifDecoder::with_limits` to raise an error when limits are exceeded.
+
+### Version 0.24.7
+
+New features:
+- Added `{ImageBuffer, DynamicImage}::write_with_encoder` to simplify writing
+  images with custom settings.
+- Expose ICC profiles stored in tiff and webp files.
+- Added option to set the background color of animated webp images.
+- New methods for sampling and interpolation of `GenericImageView`s
+
+Bug fixes:
+- Fix panic on empty dxt.
+- Fix several panics in webp decoder.
+- Allow unknown chunks at the end of webp files.
 
 ### Version 0.24.6
 

@@ -63,6 +63,7 @@ impl<W: Write> QoiEncoder<W> {
 }
 
 impl<W: Write> ImageEncoder for QoiEncoder<W> {
+    #[track_caller]
     fn write_image(
         mut self,
         buf: &[u8],
@@ -76,6 +77,15 @@ impl<W: Write> ImageEncoder for QoiEncoder<W> {
                 format!("unsupported color type {color_type:?}. Supported are Rgba8 and Rgb8."),
             )));
         }
+
+        let expected_buffer_len =
+            (width as u64 * height as u64).saturating_mul(color_type.bytes_per_pixel() as u64);
+        assert_eq!(
+            expected_buffer_len,
+            buf.len() as u64,
+            "Invalid buffer length: expected {expected_buffer_len} got {} for {width}x{height} image",
+            buf.len(),
+        );
 
         // Encode data in QOI
         let data = qoi::encode_to_vec(buf, width, height).map_err(encoding_error)?;

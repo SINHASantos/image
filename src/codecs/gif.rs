@@ -26,18 +26,17 @@
 //! ```
 #![allow(clippy::while_let_loop)]
 
-use std::convert::TryFrom;
-use std::convert::TryInto;
 use std::io::{self, Cursor, Read, Write};
 use std::marker::PhantomData;
 use std::mem;
 
 use gif::ColorOutput;
 use gif::{DisposalMethod, Frame};
-use num_rational::Ratio;
 
-use crate::animation;
+use crate::animation::{self, Ratio};
 use crate::color::{ColorType, Rgba};
+use crate::error::LimitError;
+use crate::error::LimitErrorKind;
 use crate::error::{
     DecodingError, EncodingError, ImageError, ImageResult, ParameterError, ParameterErrorKind,
     UnsupportedError, UnsupportedErrorKind,
@@ -61,19 +60,18 @@ impl<R: Read> GifDecoder<R> {
 
         Ok(GifDecoder {
             reader: decoder.read_info(r).map_err(ImageError::from_decoding)?,
-            limits: Limits::default(),
+            limits: Limits::no_limits(),
         })
     }
 
     /// Creates a new decoder that decodes the input steam `r`, using limits `limits`
+    #[deprecated(since = "0.24.8", note = "Use `new` followed by `set_limits` instead")]
     pub fn with_limits(r: R, limits: Limits) -> ImageResult<GifDecoder<R>> {
-        let mut decoder = gif::DecodeOptions::new();
-        decoder.set_color_output(ColorOutput::RGBA);
-
-        Ok(GifDecoder {
-            reader: decoder.read_info(r).map_err(ImageError::from_decoding)?,
-            limits,
-        })
+        let mut decoder = Self::new(r)?;
+        // call `.set_limits()` instead of just setting the field directly
+        // so that we raise an error in case they are exceeded
+        decoder.set_limits(limits)?;
+        Ok(decoder)
     }
 }
 
@@ -112,6 +110,17 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for GifDecoder<R> {
             Cursor::new(image::decoder_to_vec(self)?),
             PhantomData,
         ))
+    }
+
+    fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
+        limits.check_support(&crate::io::LimitSupport::default())?;
+
+        let (width, height) = self.dimensions();
+        limits.check_dimensions(width, height)?;
+
+        self.limits = limits;
+
+        Ok(())
     }
 
     fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()> {
@@ -168,12 +177,15 @@ impl<'a, R: 'a + Read> ImageDecoder<'a> for GifDecoder<R> {
         } else {
             // If the frame does not match the logical screen, read into an extra buffer
             // and 'insert' the frame from left/top to logical screen width/height.
-            let buffer_size = self.reader.buffer_size();
+            let buffer_size = (frame.width as usize)
+                .checked_mul(frame.height as usize)
+                .and_then(|s| s.checked_mul(4))
+                .ok_or(ImageError::Limits(LimitError::from_kind(
+                    LimitErrorKind::InsufficientMemory,
+                )))?;
 
             self.limits.reserve_usize(buffer_size)?;
-
             let mut frame_buffer = vec![0; buffer_size];
-
             self.limits.free_usize(buffer_size);
 
             self.reader
@@ -224,26 +236,23 @@ struct GifFrameIterator<R: Read> {
     width: u32,
     height: u32,
 
-    non_disposed_frame: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    non_disposed_frame: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
+    limits: Limits,
 }
 
 impl<R: Read> GifFrameIterator<R> {
     fn new(decoder: GifDecoder<R>) -> GifFrameIterator<R> {
         let (width, height) = decoder.dimensions();
-
-        // TODO: Avoid this cast
-        let (width, height) = (width as u32, height as u32);
+        let limits = decoder.limits.clone();
 
         // intentionally ignore the background color for web compatibility
-
-        // create the first non disposed frame
-        let non_disposed_frame = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
 
         GifFrameIterator {
             reader: decoder.reader,
             width,
             height,
-            non_disposed_frame,
+            non_disposed_frame: None,
+            limits,
         }
     }
 }
@@ -252,6 +261,28 @@ impl<R: Read> Iterator for GifFrameIterator<R> {
     type Item = ImageResult<animation::Frame>;
 
     fn next(&mut self) -> Option<ImageResult<animation::Frame>> {
+        // The iterator always produces RGBA8 images
+        const COLOR_TYPE: ColorType = ColorType::Rgba8;
+
+        // Allocate the buffer for the previous frame.
+        // This is done here and not in the constructor because
+        // the constructor cannot return an error when the allocation limit is exceeded.
+        if self.non_disposed_frame.is_none() {
+            if let Err(e) = self
+                .limits
+                .reserve_buffer(self.width, self.height, COLOR_TYPE)
+            {
+                return Some(Err(e));
+            }
+            self.non_disposed_frame = Some(ImageBuffer::from_pixel(
+                self.width,
+                self.height,
+                Rgba([0, 0, 0, 0]),
+            ));
+        }
+        // Bind to a variable to avoid repeated `.unwrap()` calls
+        let non_disposed_frame = self.non_disposed_frame.as_mut().unwrap();
+
         // begin looping over each frame
 
         let frame = match self.reader.next_frame_info() {
@@ -266,6 +297,17 @@ impl<R: Read> Iterator for GifFrameIterator<R> {
             Err(err) => return Some(Err(ImageError::from_decoding(err))),
         };
 
+        // All allocations we do from now on will be freed at the end of this function.
+        // Therefore, do not count them towards the persistent limits.
+        // Instead, create a local instance of `Limits` for this function alone
+        // which will be dropped along with all the buffers when they go out of scope.
+        let mut local_limits = self.limits.clone();
+
+        // Check the allocation we're about to perform against the limits
+        if let Err(e) = local_limits.reserve_buffer(frame.width, frame.height, COLOR_TYPE) {
+            return Some(Err(e));
+        }
+        // Allocate the buffer now that the limits allowed it
         let mut vec = vec![0; self.reader.buffer_size()];
         if let Err(err) = self.reader.read_into_buffer(&mut vec) {
             return Some(Err(ImageError::from_decoding(err)));
@@ -330,15 +372,19 @@ impl<R: Read> Iterator for GifFrameIterator<R> {
             && (self.width, self.height) == frame_buffer.dimensions()
         {
             for (x, y, pixel) in frame_buffer.enumerate_pixels_mut() {
-                let previous_pixel = self.non_disposed_frame.get_pixel_mut(x, y);
+                let previous_pixel = non_disposed_frame.get_pixel_mut(x, y);
                 blend_and_dispose_pixel(frame.disposal_method, previous_pixel, pixel);
             }
             frame_buffer
         } else {
+            // Check limits before allocating the buffer
+            if let Err(e) = local_limits.reserve_buffer(self.width, self.height, COLOR_TYPE) {
+                return Some(Err(e));
+            }
             ImageBuffer::from_fn(self.width, self.height, |x, y| {
                 let frame_x = x.wrapping_sub(frame.left);
                 let frame_y = y.wrapping_sub(frame.top);
-                let previous_pixel = self.non_disposed_frame.get_pixel_mut(x, y);
+                let previous_pixel = non_disposed_frame.get_pixel_mut(x, y);
 
                 if frame_x < frame_buffer.width() && frame_y < frame_buffer.height() {
                     let mut pixel = *frame_buffer.get_pixel(frame_x, frame_y);
@@ -426,7 +472,7 @@ impl<W: Write> GifEncoder<W> {
     /// for more information.
     pub fn new_with_speed(w: W, speed: i32) -> GifEncoder<W> {
         assert!(
-            speed >= 1 && speed <= 30,
+            (1..=30).contains(&speed),
             "speed needs to be in the range [1, 30]"
         );
         GifEncoder {
@@ -513,7 +559,7 @@ impl<W: Write> GifEncoder<W> {
         let (width, height) = self.gif_dimensions(rbga_frame.width(), rbga_frame.height())?;
 
         // Create the gif::Frame from the animation::Frame
-        let mut frame = Frame::from_rgba_speed(width, height, &mut *rbga_frame, self.speed);
+        let mut frame = Frame::from_rgba_speed(width, height, &mut rbga_frame, self.speed);
         // Saturate the conversion to u16::MAX instead of returning an error as that
         // would require a new special cased variant in ParameterErrorKind which most
         // likely couldn't be reused for other cases. This isn't a bad trade-off given
